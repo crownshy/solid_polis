@@ -27,6 +27,7 @@
 	let toastMessage = $state('');
 	let toastType = $state<'error' | 'success' | 'info'>('error');
 	let inviteLinkCopied = $state(false);
+	let isPolling = $state(false);
 
 	// List of participant WebIDs - loaded from the creator's pod
 	let participants = $state<string[]>([]);
@@ -45,6 +46,40 @@
 			}, 3000);
 			return () => clearTimeout(timer);
 		}
+	});
+
+	// Periodically check for new statements and participants
+	$effect(() => {
+		if (!poll || !session.isLoggedIn || !session.webId) return;
+
+		const POLL_INTERVAL = 10000; // Check every 10 seconds
+
+		const interval = setInterval(async () => {
+			try {
+				isPolling = true;
+				console.log('Polling for updates...');
+				const storage = new PolisStorage(session.getFetch());
+
+				// Check for new participants
+				const updatedParticipants = await storage.getParticipants(poll.creator, pollId);
+				if (updatedParticipants.length > participants.length) {
+					console.log('New participants detected:', updatedParticipants);
+					participants = updatedParticipants;
+
+					// Reload statements and votes with new participants
+					await loadStatementsAndVotes(storage);
+				} else {
+					// Even if no new participants, check for new statements/votes
+					await loadStatementsAndVotes(storage);
+				}
+			} catch (error) {
+				console.error('Error polling for updates:', error);
+			} finally {
+				isPolling = false;
+			}
+		}, POLL_INTERVAL);
+
+		return () => clearInterval(interval);
 	});
 
 	async function loadPoll() {
@@ -267,7 +302,12 @@
 			<div class="mb-8">
 				<div class="flex items-start justify-between gap-4">
 					<div class="flex-1">
-						<h1 class="text-3xl font-bold mb-2">{poll.title}</h1>
+						<div class="flex items-center gap-3">
+							<h1 class="text-3xl font-bold mb-2">{poll.title}</h1>
+							{#if isPolling}
+								<span class="text-sm text-gray-500 animate-pulse">Checking for updates...</span>
+							{/if}
+						</div>
 						{#if poll.description}
 							<p class="text-gray-600">{poll.description}</p>
 						{/if}
