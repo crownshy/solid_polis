@@ -1,11 +1,21 @@
+import { createSolidLdoDataset } from '@ldo/connected-solid';
 import {
-	overwriteFile,
-	getFile,
-	createContainerAt,
 	getPodUrlAll,
-	saveFileInContainer
+	overwriteFile,
+	getContainedResourceUrlAll,
+	getResourceAcl,
+	hasResourceAcl,
+	hasFallbackAcl,
+	createAcl,
+	createAclFromFallbackAcl,
+	getPublicAccess,
+	getPublicResourceAccess,
+	setPublicResourceAccess,
+	saveAclFor
 } from '@inrupt/solid-client';
-import { fetch } from '@inrupt/solid-client-authn-browser';
+import {
+	setPublicAccess
+} from '@inrupt/solid-client/universal';
 import type { Poll, Statement, Vote } from '$lib/types/polis';
 
 /**
@@ -20,16 +30,15 @@ function generateUUID(): string {
  * Each user's data (statements, votes) is stored in their own pod
  */
 export class PolisStorage {
+	private dataset;
 	private fetch: typeof fetch;
 	private podUrlCache: Map<string, string> = new Map();
 
 	constructor(authenticatedFetch: typeof fetch) {
 		this.fetch = authenticatedFetch;
-		console.log('PolisStorage initialized with fetch:', typeof authenticatedFetch);
-		// Verify the fetch has authentication context
-		if (!authenticatedFetch) {
-			console.error('WARNING: No fetch function provided to PolisStorage!');
-		}
+		this.dataset = createSolidLdoDataset();
+		this.dataset.setContext('solid', { fetch: authenticatedFetch });
+		console.log('PolisStorage initialized with LDO dataset');
 	}
 
 	/**
@@ -63,7 +72,7 @@ export class PolisStorage {
 			console.warn('Failed to fetch pod URLs from WebID profile:', error);
 		}
 
-		// Fallback: Try to construct pod URL from WebID for common providers
+		// Fallback: For Solid Community, pod is usually at the same origin as WebID
 		// For Inrupt: WebID like https://id.inrupt.com/username/profile/card#me
 		//             Pod is at https://storage.inrupt.com/username/
 		const webIdUrl = new URL(webId);
@@ -75,6 +84,18 @@ export class PolisStorage {
 				const username = pathParts[0];
 				const podUrl = `https://storage.inrupt.com/${username}/`;
 				console.log(`Using fallback Inrupt pod URL: ${podUrl}`);
+				this.podUrlCache.set(webId, podUrl);
+				return podUrl;
+			}
+		} else if (webIdUrl.hostname === 'solidcommunity.net') {
+			// For Solid Community, extract username and construct pod URL
+			// WebID like https://solidcommunity.net/username/profile/card#me
+			// Pod is at https://solidcommunity.net/username/
+			const pathParts = webIdUrl.pathname.split('/').filter(p => p.length > 0);
+			if (pathParts.length > 0) {
+				const username = pathParts[0];
+				const podUrl = `https://solidcommunity.net/${username}/`;
+				console.log(`Using fallback Solid Community pod URL: ${podUrl}`);
 				this.podUrlCache.set(webId, podUrl);
 				return podUrl;
 			}
@@ -108,7 +129,7 @@ export class PolisStorage {
 	 */
 	async getStatementsUrl(webId: string, pollId: string): Promise<string> {
 		const pollUrl = await this.getPollUrl(webId, pollId);
-		return `${pollUrl}/statements.json`;
+		return `${pollUrl}/statements`;
 	}
 
 	/**
@@ -116,25 +137,28 @@ export class PolisStorage {
 	 */
 	async getVotesUrl(webId: string, pollId: string): Promise<string> {
 		const pollUrl = await this.getPollUrl(webId, pollId);
-		return `${pollUrl}/votes.json`;
+		return `${pollUrl}/votes`;
 	}
 
 	/**
-	 * Ensure a container exists at the given URL
+	 * Get the URL for the participants file in the creator's pod
 	 */
-	private async ensureContainer(containerUrl: string): Promise<void> {
-		try {
-			console.log('Creating container:', containerUrl);
-			const result = await createContainerAt(containerUrl, { fetch: this.fetch });
-			console.log('Container created successfully:', containerUrl);
-		} catch (error: any) {
-			// Check if it's a 409 (conflict) which means container already exists
-			if (error?.response?.status === 409 || error?.statusCode === 409) {
-				console.log('Container already exists:', containerUrl);
-			} else {
-				console.error('Error creating container:', containerUrl, error);
-				throw error;
-			}
+	async getParticipantsUrl(creatorWebId: string, pollId: string): Promise<string> {
+		const pollUrl = await this.getPollUrl(creatorWebId, pollId);
+		return `${pollUrl}/participants`;
+	}
+
+
+	/**
+	 * Ensure a container exists by creating it if absent
+	 */
+	private async ensureContainerExists(containerUrl: string): Promise<void> {
+		console.log('Ensuring container exists:', containerUrl);
+		const resource = this.dataset.getResource(containerUrl);
+
+		if ('createIfAbsent' in resource) {
+			const result = await (resource as any).createIfAbsent();
+			console.log('Container creation result:', result.type);
 		}
 	}
 
@@ -150,33 +174,94 @@ export class PolisStorage {
 		};
 
 		try {
-			// Ensure the polis container exists
+			// Ensure parent containers exist in order
 			const polisContainer = await this.getPolisContainerUrl(webId);
-			await this.ensureContainer(polisContainer);
+			await this.ensureContainerExists(polisContainer);
 
-			// Ensure the polls container exists
-			const pollsContainer = `${polisContainer}polls/`;
-			await this.ensureContainer(pollsContainer);
+			await this.ensureContainerExists(`${polisContainer}polls/`);
 
-			// Ensure the specific poll container exists
 			const pollContainer = `${await this.getPollUrl(webId, pollId)}/`;
-			await this.ensureContainer(pollContainer);
+			await this.ensureContainerExists(pollContainer);
 
-			// Save the poll data
-			console.log('Saving poll to container:', pollContainer);
+			// Now create the poll resource
+			const pollUrl = `${pollContainer}poll`;
+			console.log('Creating poll resource at:', pollUrl);
+
+			const resource = this.dataset.getResource(pollUrl);
+
+			// Create the resource
+			if ('createIfAbsent' in resource) {
+				console.log('Calling createIfAbsent on poll resource...');
+				const createResult = await (resource as any).createIfAbsent();
+				console.log('Poll resource created:', createResult.type);
+			}
+
+			// Use Solid Client's overwriteFile which reliably writes files
+			console.log('Writing poll data with overwriteFile...');
 			const blob = new Blob([JSON.stringify(newPoll)], { type: 'application/json' });
+			await overwriteFile(pollUrl, blob, { fetch: this.fetch });
+			console.log('Poll data written successfully');
 
-			// Use saveFileInContainer which handles creation better
-			const savedFile = await saveFileInContainer(
-				pollContainer,
-				blob,
-				{
-					slug: 'poll.json',
-					contentType: 'application/json',
-					fetch: this.fetch
+			// Verify by reading it back
+			console.log('Verifying poll was saved...');
+			await resource.read();
+			if ('getBlob' in resource) {
+				const blob = (resource as any).getBlob();
+				if (blob) {
+					const text = await blob.text();
+					const savedPoll = JSON.parse(text);
+					console.log('✓ Poll verified! ID:', savedPoll.id);
+				} else {
+					console.error('✗ Failed to verify - blob is null');
 				}
-			);
-			console.log('Poll saved successfully at:', savedFile);
+			}
+
+			// Set public read permissions so others can access via invite links
+			console.log('Setting public read permissions...');
+			try {
+				// Set public read access on the poll file using Universal Access Control
+				await setPublicAccess(
+					pollUrl,
+					{ read: true, append: false, write: false },
+					{ fetch: this.fetch }
+				);
+				console.log('✓ Public read permissions set on poll');
+
+				// Also set public read on the poll container
+				await setPublicAccess(
+					pollContainer,
+					{ read: true, append: false, write: false },
+					{ fetch: this.fetch }
+				);
+				console.log('✓ Public read permissions set on poll container');
+			} catch (permError) {
+				console.warn('Could not set public permissions (this is okay, poll is still created):', permError);
+			}
+
+			// Create participants file with public write access
+			console.log('Creating participants file...');
+			try {
+				const participantsUrl = `${pollContainer}participants`;
+
+				// Initialize with creator
+				const initialParticipants = [webId];
+				const blob = new Blob([JSON.stringify(initialParticipants)], { type: 'application/json' });
+				await overwriteFile(participantsUrl, blob, { fetch: this.fetch });
+				console.log('✓ Participants file created');
+
+				// Set public read and write permissions using WAC
+				// This is more permissive but necessary for collaborative participation tracking
+				await setPublicResourceAccess(
+					participantsUrl,
+					{ read: true, append: true, write: true },
+					{ fetch: this.fetch }
+				);
+				console.log('✓ Public read/write permissions set on participants file');
+			} catch (permError) {
+				console.warn('Could not create/set permissions on participants file:', permError);
+			}
+
+			console.log('Poll saved successfully');
 		} catch (error) {
 			console.error('Error creating poll:', error);
 			throw error;
@@ -190,10 +275,18 @@ export class PolisStorage {
 	 */
 	async getPoll(webId: string, pollId: string): Promise<Poll | null> {
 		try {
-			const pollUrl = `${await this.getPollUrl(webId, pollId)}/poll.json`;
-			const file = await getFile(pollUrl, { fetch: this.fetch });
-			const text = await file.text();
-			return text ? JSON.parse(text) : null;
+			const pollUrl = `${await this.getPollUrl(webId, pollId)}/poll`;
+			const resource = this.dataset.getResource(pollUrl);
+			await resource.read();
+
+			if ('getBlob' in resource) {
+				const blob = resource.getBlob();
+				if (blob) {
+					const text = await blob.text();
+					return text ? JSON.parse(text) : null;
+				}
+			}
+			return null;
 		} catch (error) {
 			console.error('Error fetching poll:', error);
 			return null;
@@ -207,7 +300,8 @@ export class PolisStorage {
 		webId: string,
 		pollId: string,
 		text: string,
-		authorName?: string
+		authorName?: string,
+		creatorWebId?: string
 	): Promise<Statement> {
 		const statement: Statement = {
 			id: generateUUID(),
@@ -221,21 +315,47 @@ export class PolisStorage {
 		const statementsUrl = await this.getStatementsUrl(webId, pollId);
 
 		try {
-			// Try to get existing statements
+			// Try to read existing statements
 			let statements: Statement[] = [];
+			let isNewFile = false;
 			try {
-				const file = await getFile(statementsUrl, { fetch: this.fetch });
-				const text = await file.text();
-				statements = text ? JSON.parse(text) : [];
+				const response = await this.fetch(statementsUrl);
+				if (response.ok) {
+					const text = await response.text();
+					statements = text ? JSON.parse(text) : [];
+				} else if (response.status === 404) {
+					isNewFile = true;
+				}
 			} catch (e) {
-				// File doesn't exist yet, that's fine
+				// Resource doesn't exist yet, that's fine
+				isNewFile = true;
 			}
 
 			statements.push(statement);
 
-			// Save updated statements
+			// Write updated statements using overwriteFile
 			const blob = new Blob([JSON.stringify(statements)], { type: 'application/json' });
 			await overwriteFile(statementsUrl, blob, { fetch: this.fetch });
+			console.log('Statement added successfully');
+
+			// Set public read permissions on first creation
+			if (isNewFile) {
+				try {
+					await setPublicAccess(
+						statementsUrl,
+						{ read: true, append: false, write: false },
+						{ fetch: this.fetch }
+					);
+					console.log('✓ Public read permissions set on statements file');
+				} catch (permError) {
+					console.warn('Could not set public permissions on statements:', permError);
+				}
+			}
+
+			// Register user as a participant if creator is provided
+			if (creatorWebId && webId !== creatorWebId) {
+				await this.addParticipant(creatorWebId, pollId, webId);
+			}
 		} catch (error) {
 			console.error('Error adding statement:', error);
 			throw error;
@@ -250,11 +370,19 @@ export class PolisStorage {
 	async getStatements(webId: string, pollId: string): Promise<Statement[]> {
 		try {
 			const statementsUrl = await this.getStatementsUrl(webId, pollId);
-			const file = await getFile(statementsUrl, { fetch: this.fetch });
-			const text = await file.text();
-			return text ? JSON.parse(text) : [];
+			const resource = this.dataset.getResource(statementsUrl);
+			await resource.read();
+
+			if ('getBlob' in resource) {
+				const blob = resource.getBlob();
+				if (blob) {
+					const text = await blob.text();
+					return text ? JSON.parse(text) : [];
+				}
+			}
+			return [];
 		} catch (error) {
-			// File might not exist yet
+			// Resource might not exist yet
 			return [];
 		}
 	}
@@ -266,7 +394,8 @@ export class PolisStorage {
 		webId: string,
 		pollId: string,
 		statementId: string,
-		value: 'agree' | 'disagree' | 'pass'
+		value: 'agree' | 'disagree' | 'pass',
+		creatorWebId?: string
 	): Promise<Vote> {
 		const vote: Vote = {
 			id: generateUUID(),
@@ -280,23 +409,49 @@ export class PolisStorage {
 		const votesUrl = await this.getVotesUrl(webId, pollId);
 
 		try {
-			// Try to get existing votes
+			// Try to read existing votes
 			let votes: Vote[] = [];
+			let isNewFile = false;
 			try {
-				const file = await getFile(votesUrl, { fetch: this.fetch });
-				const text = await file.text();
-				votes = text ? JSON.parse(text) : [];
+				const response = await this.fetch(votesUrl);
+				if (response.ok) {
+					const text = await response.text();
+					votes = text ? JSON.parse(text) : [];
+				} else if (response.status === 404) {
+					isNewFile = true;
+				}
 			} catch (e) {
-				// File doesn't exist yet, that's fine
+				// Resource doesn't exist yet, that's fine
+				isNewFile = true;
 			}
 
 			// Remove any existing vote for this statement
 			const filteredVotes = votes.filter((v) => v.statementId !== statementId);
 			filteredVotes.push(vote);
 
-			// Save updated votes
+			// Write updated votes using overwriteFile
 			const blob = new Blob([JSON.stringify(filteredVotes)], { type: 'application/json' });
 			await overwriteFile(votesUrl, blob, { fetch: this.fetch });
+			console.log('Vote added successfully');
+
+			// Set public read permissions on first creation
+			if (isNewFile) {
+				try {
+					await setPublicAccess(
+						votesUrl,
+						{ read: true, append: false, write: false },
+						{ fetch: this.fetch }
+					);
+					console.log('✓ Public read permissions set on votes file');
+				} catch (permError) {
+					console.warn('Could not set public permissions on votes:', permError);
+				}
+			}
+
+			// Register user as a participant if creator is provided
+			if (creatorWebId && webId !== creatorWebId) {
+				await this.addParticipant(creatorWebId, pollId, webId);
+			}
 		} catch (error) {
 			console.error('Error adding vote:', error);
 			throw error;
@@ -311,11 +466,19 @@ export class PolisStorage {
 	async getVotes(webId: string, pollId: string): Promise<Vote[]> {
 		try {
 			const votesUrl = await this.getVotesUrl(webId, pollId);
-			const file = await getFile(votesUrl, { fetch: this.fetch });
-			const text = await file.text();
-			return text ? JSON.parse(text) : [];
+			const resource = this.dataset.getResource(votesUrl);
+			await resource.read();
+
+			if ('getBlob' in resource) {
+				const blob = resource.getBlob();
+				if (blob) {
+					const text = await blob.text();
+					return text ? JSON.parse(text) : [];
+				}
+			}
+			return [];
 		} catch (error) {
-			// File might not exist yet
+			// Resource might not exist yet
 			return [];
 		}
 	}
@@ -351,4 +514,125 @@ export class PolisStorage {
 
 		return allVotes;
 	}
+
+	/**
+	 * List all polls for a user
+	 */
+	async listUserPolls(webId: string): Promise<Poll[]> {
+		try {
+			const pollsContainer = `${await this.getPolisContainerUrl(webId)}polls/`;
+			console.log('Listing polls from:', pollsContainer);
+
+			// Get all resources in the polls container
+			const response = await this.fetch(pollsContainer);
+			if (!response.ok) {
+				console.log('Polls container does not exist yet');
+				return [];
+			}
+
+			const containerData = await response.text();
+
+			// Parse the container to get poll IDs
+			// Extract URLs that look like poll directories
+			const pollIdRegex = /([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\//g;
+			const matches = [...containerData.matchAll(pollIdRegex)];
+			const pollIds = [...new Set(matches.map(m => m[1]))];
+
+			console.log('Found poll IDs:', pollIds);
+
+			// Fetch each poll's metadata
+			const polls: Poll[] = [];
+			await Promise.all(
+				pollIds.map(async (pollId) => {
+					const poll = await this.getPoll(webId, pollId);
+					if (poll) {
+						polls.push(poll);
+					}
+				})
+			);
+
+			return polls.sort((a, b) => new Date(b.created).getTime() - new Date(a.created).getTime());
+		} catch (error) {
+			console.error('Error listing polls:', error);
+			return [];
+		}
+	}
+
+	/**
+	 * Check if user has participated in a poll (has statements or votes)
+	 */
+	async hasParticipated(webId: string, pollId: string): Promise<boolean> {
+		try {
+			const [statements, votes] = await Promise.all([
+				this.getStatements(webId, pollId),
+				this.getVotes(webId, pollId)
+			]);
+
+			return statements.length > 0 || votes.length > 0;
+		} catch (error) {
+			return false;
+		}
+	}
+
+	/**
+	 * Get all participants for a poll from the creator's pod
+	 */
+	async getParticipants(creatorWebId: string, pollId: string): Promise<string[]> {
+		try {
+			const participantsUrl = await this.getParticipantsUrl(creatorWebId, pollId);
+			const response = await this.fetch(participantsUrl);
+
+			if (!response.ok) {
+				if (response.status === 404) {
+					// Participants file doesn't exist yet
+					return [];
+				}
+				throw new Error(`Failed to fetch participants: ${response.status}`);
+			}
+
+			const text = await response.text();
+			const participants: string[] = text ? JSON.parse(text) : [];
+
+			// Return unique participants
+			return [...new Set(participants)];
+		} catch (error) {
+			console.error('Error getting participants:', error);
+			return [];
+		}
+	}
+
+	/**
+	 * Add a participant to the poll's participant list in the creator's pod
+	 */
+	async addParticipant(creatorWebId: string, pollId: string, participantWebId: string): Promise<void> {
+		try {
+			const participantsUrl = await this.getParticipantsUrl(creatorWebId, pollId);
+
+			// Get existing participants
+			let participants: string[] = [];
+			try {
+				const response = await this.fetch(participantsUrl);
+				if (response.ok) {
+					const text = await response.text();
+					participants = text ? JSON.parse(text) : [];
+				}
+			} catch (e) {
+				// File doesn't exist yet, that's fine
+			}
+
+			// Add new participant if not already in list
+			if (!participants.includes(participantWebId)) {
+				participants.push(participantWebId);
+
+				// Write updated participants list
+				const blob = new Blob([JSON.stringify(participants)], { type: 'application/json' });
+				await overwriteFile(participantsUrl, blob, { fetch: this.fetch });
+				console.log('✓ Participant added:', participantWebId);
+			}
+		} catch (error) {
+			console.error('Error adding participant:', error);
+			// Don't throw - participation tracking is optional
+		}
+	}
+
 }

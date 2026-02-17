@@ -1,3 +1,4 @@
+import { goto } from "$app/navigation";
 import { Session, type ISessionInfo } from "@inrupt/solid-client-authn-browser";
 
 class SolidSession {
@@ -7,13 +8,15 @@ class SolidSession {
 	isLoggedIn: boolean = $state(false)
 	sessionId: string | undefined = $state()
 	webId: string | undefined = $state()
+	isRestoringSession: boolean = $state(true) // Start as true to prevent flash
 
 	constructor() {
-		this.solidSession.events.on("login", this.updateSession)
-		this.solidSession.events.on("logout", this.updateSession)
+		this.solidSession.events.on("login", () => this.updateSession())
+		this.solidSession.events.on("logout", () => this.updateSession())
+		this.solidSession.events.on("sessionRestore", () => this.updateSession())
 	}
 
-	updateSession() {
+	updateSession = () => {
 		if (this.solidSession === undefined) {
 			this.session = undefined
 			this.info = undefined
@@ -41,9 +44,15 @@ class SolidSession {
 	}
 
 	async login(issuer: string) {
+		// Store current URL to return to after OAuth completes
+		const currentPath = window.location.pathname + window.location.search;
+		if (currentPath !== '/') {
+			sessionStorage.setItem('solid-polis-post-login-path', currentPath);
+		}
+
 		await this.solidSession.login({
 			oidcIssuer: issuer,
-			redirectUrl: window.location.href,
+			redirectUrl: window.location.origin,
 			clientName: "Polis-Solid Svelte App"
 		});
 		this.updateSession();
@@ -59,16 +68,54 @@ const SSession = new SolidSession();
 
 
 export async function handleRedirectAfterLogin() {
-	console.log("running handle redirect after login")
-	let sessionInfo = await SSession.solidSession.handleIncomingRedirect({ url: window.location.href, restorePreviousSession: true });
-	console.log(sessionInfo)
-	console.log(SSession.solidSession)
-	setTimeout(() => {
-		SSession.updateSession()
-		if (SSession.isLoggedIn) {
-			console.log("Logged in as", SSession.webId);
+	console.log("=== handleRedirectAfterLogin START ===");
+	console.log("Current URL:", window.location.href);
+	SSession.isRestoringSession = true;
+
+	try {
+		// Check if this is an OAuth callback (has code/state in URL)
+		const urlParams = new URLSearchParams(window.location.search);
+		const isOAuthCallback = urlParams.has('code') && urlParams.has('state');
+		console.log("Is OAuth callback?", isOAuthCallback);
+
+		const sessionInfo = await SSession.solidSession.handleIncomingRedirect({
+			restorePreviousSession: true
+		});
+
+		if (sessionInfo?.isLoggedIn) {
+			console.log("Session restored! Logged in as:", sessionInfo.webId);
+
+			// Only redirect to stored path after fresh OAuth login, not on regular session restore
+			if (isOAuthCallback) {
+				const postLoginPath = sessionStorage.getItem('solid-polis-post-login-path');
+				const currentPath = window.location.pathname + window.location.search;
+				console.log("Stored path:", postLoginPath);
+				console.log("Current path:", currentPath);
+
+				// Only redirect if the stored path is different from current location
+				if (postLoginPath && postLoginPath !== currentPath && !currentPath.includes('code=')) {
+					console.log(">>> REDIRECTING to stored path:", postLoginPath);
+					sessionStorage.removeItem('solid-polis-post-login-path');
+					goto(postLoginPath)
+					// window.location.href = postLoginPath;
+					return;
+				} else {
+					console.log("Not redirecting - clearing stored path");
+					sessionStorage.removeItem('solid-polis-post-login-path');
+				}
+			}
+		} else {
+			console.log("No previous session found");
 		}
-	})
+
+		// Update the reactive session state
+		SSession.updateSession();
+		console.log("=== handleRedirectAfterLogin END ===");
+	} catch (error) {
+		console.error("Error restoring session:", error);
+	} finally {
+		SSession.isRestoringSession = false;
+	}
 }
 
 export { SSession as session };

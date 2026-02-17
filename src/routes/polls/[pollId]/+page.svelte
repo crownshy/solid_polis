@@ -1,12 +1,22 @@
 <script lang="ts">
 	import { page } from '$app/state';
+	import { browser } from '$app/environment';
 	import { session } from '$lib/solid/auth.svelte';
 	import { PolisStorage } from '$lib/solid/polis-storage';
 	import type { Poll, Statement, Vote, StatementWithVotes, VoteCount } from '$lib/types/polis';
 	import StatementItem from '$lib/components/StatementItem.svelte';
 	import AddStatement from '$lib/components/AddStatement.svelte';
+	import Toast from '$lib/components/Toast.svelte';
 
 	const pollId = $derived(page.params.pollId);
+	const creatorWebId = $derived(page.url.searchParams.get('creator'));
+
+	// Debug logging
+	$effect(() => {
+		console.log("Poll page loaded - Poll ID:", pollId);
+		console.log("Poll page loaded - Creator WebID from URL:", creatorWebId);
+		console.log("Poll page loaded - Full URL:", window.location.href);
+	});
 
 	let poll = $state<Poll | null>(null);
 	let statements = $state<StatementWithVotes[]>([]);
@@ -14,14 +24,26 @@
 	let error = $state('');
 	let voting = $state(false);
 	let adding = $state(false);
+	let toastMessage = $state('');
+	let toastType = $state<'error' | 'success' | 'info'>('error');
+	let inviteLinkCopied = $state(false);
 
-	// List of participant WebIDs - in a real app, this would come from the poll metadata
-	// For now, we'll just use the current user and creator
+	// List of participant WebIDs - loaded from the creator's pod
 	let participants = $state<string[]>([]);
 
 	$effect(() => {
 		if (session.isLoggedIn && session.webId) {
 			loadPoll();
+		}
+	});
+
+	// Auto-reset the invite link copied state after 3 seconds
+	$effect(() => {
+		if (inviteLinkCopied) {
+			const timer = setTimeout(() => {
+				inviteLinkCopied = false;
+			}, 3000);
+			return () => clearTimeout(timer);
 		}
 	});
 
@@ -35,8 +57,12 @@
 			// Use the authenticated fetch from the session
 			const storage = new PolisStorage(session.getFetch());
 
-			// Try to load poll from creator's pod (current user for now)
-			poll = await storage.getPoll(session.webId, pollId);
+			// Determine whose pod to load the poll from
+			// If creator param is in URL, use that; otherwise try current user's pod
+			const pollOwner = creatorWebId || session.webId;
+
+			// Try to load poll from the specified owner's pod
+			poll = await storage.getPoll(pollOwner, pollId);
 
 			if (!poll) {
 				error = 'Poll not found. Make sure you have access to this poll.';
@@ -44,10 +70,16 @@
 				return;
 			}
 
-			// Set participants (creator + current user)
-			participants = [poll.creator];
-			if (session.webId !== poll.creator) {
-				participants.push(session.webId);
+			// Load participants from the creator's pod
+			participants = await storage.getParticipants(poll.creator, pollId);
+			console.log('Loaded participants:', participants);
+
+			// If no participants found, fall back to creator
+			if (participants.length === 0) {
+				participants = [poll.creator];
+				if (session.webId !== poll.creator) {
+					participants.push(session.webId);
+				}
 			}
 
 			// Load statements and votes from all participants
@@ -97,38 +129,121 @@
 	}
 
 	async function handleVote(statementId: string, value: 'agree' | 'disagree' | 'pass') {
-		if (!session.webId || !pollId) return;
+		if (!session.webId || !pollId || !poll) return;
 
-		voting = true;
+		// Find the statement to update
+		const statementIndex = statements.findIndex((s) => s.id === statementId);
+		if (statementIndex === -1) return;
 
+		// Store original state for rollback
+		const originalStatement = { ...statements[statementIndex] };
+		const originalVotes = { ...originalStatement.votes };
+		const originalUserVote = originalStatement.userVote;
+
+		// Optimistically update the UI
+		const statement = statements[statementIndex];
+
+		// Remove old vote count if exists
+		if (statement.userVote) {
+			statement.votes[statement.userVote]--;
+		}
+
+		// Add new vote count
+		statement.votes[value]++;
+		statement.userVote = value;
+
+		// Trigger reactivity
+		statements = [...statements];
+
+		// Try to save in background
 		try {
 			const storage = new PolisStorage(session.getFetch());
-			await storage.addVote(session.webId, pollId, statementId, value);
+			await storage.addVote(session.webId, pollId, statementId, value, poll.creator);
 
-			// Reload statements and votes to reflect the change
-			await loadStatementsAndVotes(storage);
+			// Reload participants list
+			const updatedParticipants = await storage.getParticipants(poll.creator, pollId);
+			if (updatedParticipants.length > participants.length) {
+				participants = updatedParticipants;
+				console.log('Updated participants list:', participants);
+			}
 		} catch (err) {
-			error = `Failed to vote: ${err instanceof Error ? err.message : 'Unknown error'}`;
-		} finally {
-			voting = false;
+			// Rollback on error
+			statements[statementIndex].votes = originalVotes;
+			statements[statementIndex].userVote = originalUserVote;
+			statements = [...statements];
+
+			toastMessage = 'Failed to save vote. Please try again.';
+			toastType = 'error';
 		}
 	}
 
 	async function handleAddStatement(text: string) {
-		if (!session.webId || !pollId) return;
+		if (!session.webId || !pollId || !poll) return;
 
-		adding = true;
+		// Create optimistic statement
+		const tempId = `temp-${Date.now()}`;
+		const optimisticStatement: StatementWithVotes = {
+			id: tempId,
+			pollId,
+			text,
+			author: session.webId,
+			created: new Date(),
+			votes: { agree: 0, disagree: 0, pass: 0 }
+		};
 
+		// Add to UI immediately
+		statements = [optimisticStatement, ...statements];
+		adding = false; // Close the form
+
+		// Try to save in background
 		try {
 			const storage = new PolisStorage(session.getFetch());
-			await storage.addStatement(session.webId, pollId, text);
+			const savedStatement = await storage.addStatement(
+				session.webId,
+				pollId,
+				text,
+				undefined,
+				poll.creator
+			);
 
-			// Reload statements and votes to include the new statement
-			await loadStatementsAndVotes(storage);
+			// Replace temp ID with real ID
+			const index = statements.findIndex((s) => s.id === tempId);
+			if (index !== -1) {
+				statements[index] = {
+					...savedStatement,
+					votes: { agree: 0, disagree: 0, pass: 0 }
+				};
+				statements = [...statements];
+			}
+
+			// Reload participants list
+			const updatedParticipants = await storage.getParticipants(poll.creator, pollId);
+			if (updatedParticipants.length > participants.length) {
+				participants = updatedParticipants;
+				console.log('Updated participants list:', participants);
+			}
 		} catch (err) {
-			error = `Failed to add statement: ${err instanceof Error ? err.message : 'Unknown error'}`;
-		} finally {
-			adding = false;
+			// Remove optimistic statement on error
+			statements = statements.filter((s) => s.id !== tempId);
+
+			toastMessage = 'Failed to add statement. Please try again.';
+			toastType = 'error';
+		}
+	}
+
+	async function copyInviteLink() {
+		if (!poll || !pollId) return;
+
+		const inviteUrl = `${window.location.origin}/polls/${pollId}?creator=${encodeURIComponent(poll.creator)}`;
+
+		try {
+			await navigator.clipboard.writeText(inviteUrl);
+			inviteLinkCopied = true;
+			toastMessage = 'Invite link copied to clipboard!';
+			toastType = 'success';
+		} catch (err) {
+			toastMessage = 'Failed to copy invite link. Please try again.';
+			toastType = 'error';
 		}
 	}
 </script>
@@ -138,7 +253,7 @@
 		{#if !session.isLoggedIn}
 			<div class="bg-yellow-50 border border-yellow-200 text-yellow-800 p-4 rounded-md">
 				<p class="font-medium">Please log in to view this poll</p>
-				<a href="/login" class="text-blue-600 hover:underline">Go to login</a>
+				<a href="/" data-sveltekit-reload class="text-blue-600 hover:underline">Go to home page to login</a>
 			</div>
 		{:else if loading}
 			<div class="text-center py-8">
@@ -150,13 +265,29 @@
 			</div>
 		{:else if poll}
 			<div class="mb-8">
-				<h1 class="text-3xl font-bold mb-2">{poll.title}</h1>
-				{#if poll.description}
-					<p class="text-gray-600">{poll.description}</p>
-				{/if}
-				<p class="text-sm text-gray-500 mt-2">
-					Created by {poll.creator === session.webId ? 'you' : poll.creator}
-				</p>
+				<div class="flex items-start justify-between gap-4">
+					<div class="flex-1">
+						<h1 class="text-3xl font-bold mb-2">{poll.title}</h1>
+						{#if poll.description}
+							<p class="text-gray-600">{poll.description}</p>
+						{/if}
+						<p class="text-sm text-gray-500 mt-2">
+							Created by {poll.creator === session.webId ? 'you' : poll.creator}
+						</p>
+					</div>
+					{#if poll.creator === session.webId}
+						<button
+							onclick={copyInviteLink}
+							class="flex-shrink-0 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors flex items-center gap-2"
+						>
+							{#if inviteLinkCopied}
+								<span>✓ Copied!</span>
+							{:else}
+								<span>🔗 Copy Invite Link</span>
+							{/if}
+						</button>
+					{/if}
+				</div>
 			</div>
 
 			<div class="mb-6">
@@ -179,3 +310,7 @@
 		{/if}
 	</div>
 </div>
+
+{#if toastMessage}
+	<Toast message={toastMessage} type={toastType} onClose={() => (toastMessage = '')} />
+{/if}

@@ -8,7 +8,7 @@
 		<div class="max-w-2xl mx-auto p-6">
 			<div class="bg-yellow-50 border border-yellow-200 text-yellow-800 p-4 rounded-md">
 				<p class="font-medium">Please log in to create a poll</p>
-				<a href="/login" class="text-blue-600 hover:underline">Go to login</a>
+				<a href="/" class="text-blue-600 hover:underline">Go to home page to login</a>
 			</div>
 		</div>
 	{:else}
