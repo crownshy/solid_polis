@@ -163,6 +163,45 @@ export class PolisStorage {
 	}
 
 	/**
+	 * Set public write access on a resource by creating a custom ACL file
+	 */
+	private async setPublicWriteAccess(resourceUrl: string, ownerWebId: string): Promise<void> {
+		try {
+			console.log('Setting public write access on:', resourceUrl);
+
+			// Create ACL content manually in Turtle format
+			const aclContent = `@prefix acl: <http://www.w3.org/ns/auth/acl#>.
+@prefix foaf: <http://xmlns.com/foaf/0.1/>.
+
+# Owner has full control
+<#owner>
+    a acl:Authorization;
+    acl:agent <${ownerWebId}>;
+    acl:accessTo <${resourceUrl}>;
+    acl:mode acl:Read, acl:Write, acl:Control.
+
+# Public can read and write
+<#public>
+    a acl:Authorization;
+    acl:agentClass foaf:Agent;
+    acl:accessTo <${resourceUrl}>;
+    acl:mode acl:Read, acl:Write.
+`;
+
+			// The ACL file URL is the resource URL + .acl
+			const aclUrl = `${resourceUrl}.acl`;
+
+			// Write the ACL file
+			const blob = new Blob([aclContent], { type: 'text/turtle' });
+			await overwriteFile(aclUrl, blob, { fetch: this.fetch });
+			console.log('✓ Public write ACL created at:', aclUrl);
+		} catch (error) {
+			console.error('Error setting public write access:', error);
+			throw error;
+		}
+	}
+
+	/**
 	 * Create or join a poll
 	 */
 	async createPoll(webId: string, poll: Omit<Poll, 'id' | 'created'>): Promise<Poll> {
@@ -249,13 +288,8 @@ export class PolisStorage {
 				await overwriteFile(participantsUrl, blob, { fetch: this.fetch });
 				console.log('✓ Participants file created');
 
-				// Set public read and write permissions using WAC
-				// This is more permissive but necessary for collaborative participation tracking
-				await setPublicResourceAccess(
-					participantsUrl,
-					{ read: true, append: true, write: true },
-					{ fetch: this.fetch }
-				);
+				// Set public read and write permissions by creating a custom ACL
+				await this.setPublicWriteAccess(participantsUrl, webId);
 				console.log('✓ Public read/write permissions set on participants file');
 			} catch (permError) {
 				console.warn('Could not create/set permissions on participants file:', permError);
