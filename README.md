@@ -2,6 +2,19 @@
 
 A privacy-preserving collaborative polling application built on the Solid Protocol using Svelte 5 and LDO (Linked Data Objects).
 
+This is a work in progress currently we have 
+
+1. Generating a polis poll. This creates a record in the creators pod.
+2. Submitting statements and votes that are stored in a users solid pod 
+3. Invite links to join a poll
+4. Live updating of statements and polls 
+
+What we still need are 
+
+1. A way to run the math server over the results to produce reports 
+2. A way to cryptographically sign a statement / vote pair to ensure that we can detect if someone changes a statement and invalidate those votes on it.
+3. Ways of restricting access to a poll
+
 ## Features
 
 - **Privacy-First**: All user data (statements, votes) is stored in individual Solid pods
